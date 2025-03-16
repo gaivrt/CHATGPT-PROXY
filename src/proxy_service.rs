@@ -304,7 +304,7 @@ async fn get_access_token(config: &AppConfig) -> Result<String> {
     let status = resp.status();
     tracing::debug!("会话端点响应状态码: {}", status);
     
-    if (!status.is_success()) {
+    if !status.is_success() {
         let error_text = resp.text().await?;
         tracing::error!("获取访问令牌失败: 状态 {}, 内容: {}", status, error_text);
         return Err(anyhow!("获取访问令牌失败: 状态 {}, 内容: {}", status, error_text));
@@ -363,43 +363,122 @@ fn map_model_name(model_name: &str) -> String {
 
 /// 解析ChatGPT网页端返回的响应，提取有用内容
 fn parse_chatgpt_response(response_text: &str) -> Result<String> {
-    // 这是一个简化的解析版本
-    // 实际应该处理SSE格式或特定JSON格式的响应
+    tracing::debug!("原始响应前100个字符: {}", &response_text.chars().take(100).collect::<String>());
     
-    // ChatGPT网页端的响应通常是多行数据，以data:开头
-    // 我们需要找到最后一个有效的JSON响应
-    
-    let lines: Vec<&str> = response_text.lines().collect();
-    let mut last_json = "";
-    
-    // 解析响应行
-    for line in lines.iter().rev() {
-        if line.starts_with("data:") && line.len() > 5 && *line != "data: [DONE]" {
-            last_json = line.trim_start_matches("data: ");
-            break;
-        }
+    // 检查响应是否为空
+    if response_text.is_empty() {
+        return Err(anyhow!("Empty response from ChatGPT"));
     }
-    
-    if last_json.is_empty() {
-        return Err(anyhow!("Could not find valid JSON response from ChatGPT"));
-    }
-    
-    // 解析JSON，获取消息内容
-    match serde_json::from_str::<serde_json::Value>(last_json) {
-        Ok(json) => {
-            // 提取消息内容
-            if let Some(message) = json.get("message") {
-                if let Some(content) = message.get("content") {
-                    if let Some(parts) = content.get("parts") {
-                        if let Some(text) = parts.get(0).and_then(|p| p.as_str()) {
+
+    // 如果响应是标准的JSON格式
+    if response_text.starts_with("{") {
+        match serde_json::from_str::<serde_json::Value>(response_text) {
+            Ok(json) => {
+                tracing::debug!("直接解析JSON响应");
+                // 提取消息内容 - 尝试多种可能的路径
+                if let Some(message) = json.get("message") {
+                    if let Some(content) = message.get("content") {
+                        if let Some(parts) = content.get("parts") {
+                            if let Some(text) = parts.get(0).and_then(|p| p.as_str()) {
+                                return Ok(text.to_string());
+                            }
+                        }
+                        // 如果直接有content值
+                        if let Some(text) = content.as_str() {
                             return Ok(text.to_string());
                         }
                     }
                 }
+                
+                // 尝试其他可能的路径
+                if let Some(content) = json.get("content") {
+                    if let Some(text) = content.as_str() {
+                        return Ok(text.to_string());
+                    }
+                }
+                
+                if let Some(text) = json.get("text").and_then(|t| t.as_str()) {
+                    return Ok(text.to_string());
+                }
+                
+                // 如果找不到特定路径，返回整个JSON字符串
+                return Ok(json.to_string());
+            },
+            Err(e) => {
+                tracing::warn!("JSON解析失败: {}", e);
             }
-            
-            Err(anyhow!("Failed to extract message content from ChatGPT response"))
-        },
-        Err(e) => Err(anyhow!("Failed to parse ChatGPT response JSON: {}", e)),
+        }
     }
+    
+    // 处理SSE格式 (data: 开头的行)
+    let lines: Vec<&str> = response_text.lines().collect();
+    let mut last_json = "";
+    let mut complete_response = String::new();
+    
+    // 尝试处理所有data行
+    for line in lines.iter() {
+        if line.starts_with("data:") && *line != "data: [DONE]" {
+            let content = line.trim_start_matches("data: ");
+            tracing::debug!("找到data行: {}", &content.chars().take(30).collect::<String>());
+            
+            // 尝试解析为JSON
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+                last_json = content;
+                
+                // 尝试提取消息部分
+                if let Some(message) = json.get("message") {
+                    if let Some(content) = message.get("content") {
+                        if let Some(parts) = content.get("parts") {
+                            if let Some(text) = parts.get(0).and_then(|p| p.as_str()) {
+                                complete_response.push_str(text);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 如果不是有效的JSON，可能是纯文本
+                complete_response.push_str(content);
+            }
+        }
+    }
+    
+    // 如果找到了完整的响应内容
+    if !complete_response.is_empty() {
+        return Ok(complete_response);
+    }
+    
+    // 如果解析所有data行仍未找到内容，但存在最后一个有效JSON
+    if !last_json.is_empty() {
+        match serde_json::from_str::<serde_json::Value>(last_json) {
+            Ok(json) => {
+                tracing::debug!("尝试从最后一个JSON提取内容");
+                // 尝试提取消息内容 (和上面类似)
+                if let Some(message) = json.get("message") {
+                    if let Some(content) = message.get("content") {
+                        if let Some(parts) = content.get("parts") {
+                            if let Some(text) = parts.get(0).and_then(|p| p.as_str()) {
+                                return Ok(text.to_string());
+                            }
+                        }
+                    }
+                }
+                
+                // 如果解析失败，返回原始JSON字符串
+                return Ok(json.to_string());
+            },
+            Err(e) => {
+                tracing::error!("解析最后一个JSON失败: {}", e);
+            }
+        }
+    }
+    
+    // 如果仍然找不到内容，返回原始响应的部分内容
+    let preview = if response_text.len() > 1000 {
+        format!("{}... (截断)", &response_text[..1000])
+    } else {
+        response_text.to_string()
+    };
+    
+    tracing::warn!("无法解析ChatGPT响应，返回原始内容预览: {}", preview);
+    Ok(format!("无法解析响应。原始内容: {}", preview))
 }
